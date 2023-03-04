@@ -1,0 +1,11 @@
+mode: client
+client:
+  tcp: 138.2.67.167:7890
+  name: tun0
+  ipcidr: 172.30.0.2/16
+server:
+  tcp: 0.0.0.0:7890
+  name: tun0
+  ipcidr: 172.30.0.1/16
+  outdev: eth0
+  daemon: true
