@@ -153,7 +153,7 @@ func (s *server) initIpPool() {
 	s.mask, _ = ipNet.Mask.Size()
 	sIP := ipAddr.String()
 	if common.IPv42Unit32(ipAddr) == start {
-		sIP = common.Unit322IPv4(start).String()
+		sIP = common.Unit322IPv4(start + 1).String()
 	}
 	for i := start + 1; i < end; i++ {
 		ip := common.Unit322IPv4(i).String()
