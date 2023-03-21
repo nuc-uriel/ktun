@@ -177,6 +177,7 @@ func (s *server) Run() {
 
 	// 配置masquerade
 	// iptables -t nat -A POSTROUTING -s 10.0.10.0/24 -o enp0s3 -j MASQUERADE
+	// iptables -t nat -A POSTROUTING -s 172.22.0.0/16 -j MASQUERADE
 	ipt, err := iptables.New()
 	if err != nil {
 		common.Logger.Warn("IPTable配置失败", zap.Error(err))

@@ -19,10 +19,9 @@ var clientUpCmd = &cobra.Command{
 	Short: "启动客户端",
 	Run: func(cmd *cobra.Command, args []string) {
 		tcpAddr := viper.GetString("client.tcp")
-		name := viper.GetString("client.name")
 		daemon := viper.GetBool("client.daemon")
 		if daemon {
-			command := exec.Command(os.Args[0], "client", "up", "-t", tcpAddr, "-n", name, "--daemon=false")
+			command := exec.Command(os.Args[0], "client", "up", "-t", tcpAddr, "--daemon=false")
 			err := command.Start()
 			if err != nil {
 				common.Logger.Fatal("客户端启动失败", zap.Error(err))
@@ -38,16 +37,14 @@ var clientUpCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go common.WatchExit(ctx, cancel)
-		client.New(ctx, cancel, tcpAddr, name).Run()
+		client.New(ctx, cancel, tcpAddr).Run()
 	},
 }
 
 func init() {
 	clientCmd.AddCommand(clientUpCmd)
 	clientUpCmd.Flags().StringP("tcp", "t", "11.11.11.11:7890", "TCP服务地址, 如: 11.11.11.11:7890")
-	clientUpCmd.Flags().StringP("name", "n", "tun0", "TUN设备名称, 如: tun0")
 	clientUpCmd.Flags().BoolP("daemon", "d", false, "后台启动服务")
 	viper.BindPFlag("client.tcp", clientUpCmd.Flags().Lookup("tcp"))
-	viper.BindPFlag("client.name", clientUpCmd.Flags().Lookup("name"))
 	viper.BindPFlag("client.daemon", clientUpCmd.Flags().Lookup("daemon"))
 }

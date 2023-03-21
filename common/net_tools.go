@@ -11,6 +11,21 @@ import (
 	"go.uber.org/zap"
 )
 
+func InitTUN(name string) (*water.Interface, error) {
+	// 创建tun
+	config := water.Config{
+		DeviceType: water.TUN,
+	}
+	config.Name = name
+
+	ifce, err := water.New(config)
+	if err != nil {
+		Logger.Warn("创建失败", zap.String("tunName", name), zap.Error(err))
+		return nil, errors.New("创建失败")
+	}
+	return ifce, nil
+}
+
 func CreateTUN(name, addr string) (*water.Interface, error) {
 	// 创建tun
 	config := water.Config{
@@ -39,7 +54,7 @@ func CreateTUN(name, addr string) (*water.Interface, error) {
 }
 
 func bindIP(name, addr string) error {
-	tun0, err := getTunLink(name)
+	tun0, err := GetTunLink(name)
 	if err != nil {
 		return err
 	}
@@ -60,7 +75,7 @@ func bindIP(name, addr string) error {
 	return nil
 }
 
-func getTunLink(name string) (*netlink.Tuntap, error) {
+func GetTunLink(name string) (*netlink.Tuntap, error) {
 	l, err := netlink.LinkByName(name)
 	if err != nil {
 		Logger.Warn("设备创建失败", zap.String("tunName", name), zap.Error(err))
@@ -75,7 +90,7 @@ func getTunLink(name string) (*netlink.Tuntap, error) {
 }
 
 func upTUN(name string) error {
-	tun0, err := getTunLink(name)
+	tun0, err := GetTunLink(name)
 	if err != nil {
 		return err
 	}
@@ -88,7 +103,7 @@ func upTUN(name string) error {
 }
 
 func DelTUN(name string) error {
-	tun0, err := getTunLink(name)
+	tun0, err := GetTunLink(name)
 	if err != nil {
 		return nil
 	}
@@ -100,7 +115,7 @@ func DelTUN(name string) error {
 }
 
 func ReadPack(ctx context.Context, tunIface *water.Interface) <-chan *protocol.KTunMessage {
-	tun0, _ := getTunLink(tunIface.Name())
+	tun0, _ := GetTunLink(tunIface.Name())
 	buffer := make([]byte, tun0.MTU)
 	packs := make(chan *protocol.KTunMessage, 1)
 	go func() {
@@ -134,4 +149,56 @@ func ReadPack(ctx context.Context, tunIface *water.Interface) <-chan *protocol.K
 		}
 	}()
 	return packs
+}
+
+func GetDefaultDev(nh *netlink.Handle) (link netlink.Link) {
+	if nh == nil {
+		nh, _ = netlink.NewHandle()
+	}
+	rs, err := nh.RouteList(nil, netlink.FAMILY_V4)
+	if err != nil {
+		Logger.Error("路由查询失败", zap.Error(err))
+	}
+	for _, r := range rs {
+		if r.Dst == nil {
+			link, err = netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				Logger.Error("设备查询失败", zap.Error(err))
+			}
+			break
+		}
+	}
+	return
+}
+
+func GetDefaultRoute(nh *netlink.Handle, link netlink.Link) (route netlink.Route) {
+	if nh == nil {
+		nh, _ = netlink.NewHandle()
+	}
+	rs, err := nh.RouteList(link, netlink.FAMILY_V4)
+	if err != nil {
+		Logger.Error("路由查询失败", zap.Error(err))
+	}
+	for _, r := range rs {
+		if r.Dst == nil {
+			route = r
+			break
+		}
+	}
+	return
+}
+
+func GetDefaultAddr(nh *netlink.Handle, link netlink.Link) (addr netlink.Addr) {
+	if nh == nil {
+		nh, _ = netlink.NewHandle()
+	}
+
+	addrs, err := nh.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		Logger.Error("地址查询失败", zap.Error(err))
+	}
+	if len(addrs) > 0 {
+		addr = addrs[0]
+	}
+	return
 }
