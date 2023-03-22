@@ -22,13 +22,14 @@ var (
 )
 
 type client struct {
-	Addr      string
-	IpCIDR    string
-	Ctx       context.Context
-	Cancel    context.CancelFunc
-	msgQueue  chan []byte
-	heartbeat *time.Timer
-	ipRange   [][]uint32
+	Addr        string
+	IpCIDR      string
+	Ctx         context.Context
+	Cancel      context.CancelFunc
+	msgQueue    chan []byte
+	heartbeat   *time.Timer
+	ipRange     [][]uint32
+	defaltRange [][]uint32
 }
 
 func (c *client) connect() *net.TCPConn {
@@ -178,7 +179,7 @@ func (c *client) initIPRange() error {
 	common.Logger.Info("IP池生成中...")
 	// url := "http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
 	url := "http://203.119.102.40/apnic/stats/apnic/delegated-apnic-latest"
-	ipRange, err := common.InternalIPInit(url)
+	ipRange, err := common.InternalIPInit(url, c.defaltRange)
 	if err != nil {
 		common.Logger.Error("国内IP池生成失败", zap.Error(err))
 		return err
@@ -223,6 +224,10 @@ func (c *client) Run() {
 	}
 	defer ktNh.Close()
 
+	// 开启回环口
+	lo, _ := ktNh.LinkByName("lo")
+	ktNh.LinkSetUp(lo)
+
 	// 将主空间默认设备移入新空间
 	mainNh.LinkSetNsFd(dev, int(ktNs))
 	nDev, err := ktNh.LinkByName(devName)
@@ -252,6 +257,24 @@ func (c *client) Run() {
 		common.Logger.Error("网络空间TUN设备创建失败", zap.Error(err))
 		return
 	}
+
+	defer func() {
+		ktNh.LinkSetNsFd(nDev, int(mainNs))
+		dev, err = mainNh.LinkByName(devName)
+		if err != nil {
+			common.Logger.Error("获取默认设备失败", zap.Error(err))
+		}
+		mainNh.AddrAdd(dev, &devAddr)
+		err = mainNh.LinkSetUp(dev)
+		if err != nil {
+			common.Logger.Error("网络启动失败", zap.Error(err))
+		}
+		err = mainNh.RouteAdd(&devRoute)
+		if err != nil {
+			common.Logger.Error("路由创建失败", zap.Error(err))
+		}
+		netns.DeleteNamed(NsName)
+	}()
 
 	// 连接服务器
 	conn := c.connect()
@@ -300,13 +323,19 @@ func (c *client) Run() {
 		}
 	}
 
-	// // 初始化国内IP解析
+	ipAddr, ipNet, _ = net.ParseCIDR(devAddr.IPNet.String())
+	ipNet.IP = ipAddr
+	privS, privE, _ := common.PrivateIPv4Range(ipNet)
+	c.defaltRange = [][]uint32{{privS, privE}}
+
+	// 初始化国内IP解析
 	err = c.initIPRange()
 	if err != nil {
 		common.Logger.Error("国内IP池初始化失败", zap.Error(err))
+		return
 	}
 
-	// // 启动定时刷新机制
+	// 启动定时刷新机制
 	go c.updateIpRange()
 
 	// 主命名空间添加tun设备
@@ -315,6 +344,8 @@ func (c *client) Run() {
 		common.Logger.Error("设备查询失败", zap.Error(err))
 		return
 	}
+
+	defer mainNh.LinkDel(tun0)
 
 	ipAddr, ipNet, _ = net.ParseCIDR(c.IpCIDR)
 	ipNet.IP = ipAddr
@@ -329,25 +360,6 @@ func (c *client) Run() {
 		Dst: nil,
 	})
 
-	defer func() {
-		mainNh.LinkDel(tun0)
-		ktNh.LinkSetNsFd(nDev, int(mainNs))
-		dev, err = mainNh.LinkByName(devName)
-		if err != nil {
-			common.Logger.Error("获取默认设备失败", zap.Error(err))
-		}
-		mainNh.AddrAdd(dev, &devAddr)
-		err = mainNh.LinkSetUp(dev)
-		if err != nil {
-			common.Logger.Error("网络启动失败", zap.Error(err))
-		}
-		err = mainNh.RouteAdd(&devRoute)
-		if err != nil {
-			common.Logger.Error("路由创建失败", zap.Error(err))
-		}
-		netns.DeleteNamed(NsName)
-	}()
-
 	// 监听tun
 	go c.sendServer(mainTunI, conn, ipAddr, ktTunI)
 	go c.startPing(conn)
@@ -360,9 +372,12 @@ func (c *client) Run() {
 
 func New(ctx context.Context, cancel context.CancelFunc, addr string) *client {
 	return &client{
-		Addr:     addr,
-		Ctx:      ctx,
-		Cancel:   cancel,
-		msgQueue: make(chan []byte, 200),
+		Addr:        addr,
+		Ctx:         ctx,
+		Cancel:      cancel,
+		msgQueue:    make(chan []byte, 200),
+		defaltRange: make([][]uint32, 0),
 	}
 }
+
+// ip route add 172.17.0.0/16 dev ktun0

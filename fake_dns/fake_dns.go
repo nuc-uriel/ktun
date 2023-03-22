@@ -149,7 +149,7 @@ func (fd *FakeDns) initIPRange() error {
 	common.Logger.Info("IP池生成中...")
 	// url := "http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
 	url := "http://203.119.102.40/apnic/stats/apnic/delegated-apnic-latest"
-	ipRange, err := common.InternalIPInit(url)
+	ipRange, err := common.InternalIPInit(url, [][]uint32{})
 	if err != nil {
 		common.Logger.Error("国内IP池生成失败", zap.Error(err))
 		return err

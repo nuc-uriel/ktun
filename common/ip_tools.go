@@ -38,7 +38,7 @@ func PrivateIPv4Range(ipNet *net.IPNet) (start, end uint32, err error) {
 	return
 }
 
-func InternalIPInit(url string) (reduceIPRange [][]uint32, err error) {
+func InternalIPInit(url string, defaultRanges [][]uint32) (reduceIPRange [][]uint32, err error) {
 	// http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest
 	resp, err := http.Get(url)
 	if err != nil {
@@ -48,9 +48,11 @@ func InternalIPInit(url string) (reduceIPRange [][]uint32, err error) {
 	reader.Comma = '|'
 	reader.Comment = '#'
 	reader.FieldsPerRecord = -1
-	ipRanges := make([][]uint32, 0)
+	n := len(defaultRanges)
+	ipRanges := make([][]uint32, n, n)
+	copy(ipRanges, defaultRanges)
 
-	record := []string{}
+	var record []string
 	for {
 		record, err = reader.Read()
 		if err == io.EOF {
