@@ -340,6 +340,7 @@ func (c *client) Run() {
 	})
 	ktNh.LinkSetUp(tun1)
 
+	netns.Set(ktNs)
 	// 配置masquerade
 	// iptables -t nat -A POSTROUTING -s 172.22.0.0/16 -j MASQUERADE
 	ipt, err := iptables.New()
