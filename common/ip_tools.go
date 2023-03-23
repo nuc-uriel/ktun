@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
@@ -39,8 +40,16 @@ func PrivateIPv4Range(ipNet *net.IPNet) (start, end uint32, err error) {
 }
 
 func InternalIPInit(url string, defaultRanges [][]uint32) (reduceIPRange [][]uint32, err error) {
-	// http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest
-	resp, err := http.Get(url)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return DefaultDialer.DialContext(ctx, network, addr)
+			},
+		},
+	}
+
+	resp, err := client.Get(url)
+
 	if err != nil {
 		return
 	}
@@ -49,7 +58,7 @@ func InternalIPInit(url string, defaultRanges [][]uint32) (reduceIPRange [][]uin
 	reader.Comment = '#'
 	reader.FieldsPerRecord = -1
 	n := len(defaultRanges)
-	ipRanges := make([][]uint32, n, n)
+	ipRanges := make([][]uint32, n)
 	copy(ipRanges, defaultRanges)
 
 	var record []string

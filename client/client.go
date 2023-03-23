@@ -32,16 +32,12 @@ type client struct {
 	defaltRange [][]uint32
 }
 
-func (c *client) connect() *net.TCPConn {
-	servAddr, err := net.ResolveTCPAddr("tcp", c.Addr)
-	if err != nil {
-		common.Logger.Fatal("服务器IP解析失败", zap.String("addr", c.Addr), zap.Error(err))
-	}
-	conn, err := net.DialTCP("tcp", nil, servAddr)
+func (c *client) connect(dev string) *net.TCPConn {
+	conn, err := common.GetDial(NsName, dev).Dial("tcp", c.Addr)
 	if err != nil {
 		common.Logger.Fatal("连接服务器失败", zap.String("addr", c.Addr), zap.Error(err))
 	}
-	return conn
+	return conn.(*net.TCPConn)
 }
 
 func (c *client) sendServer(tunIface *water.Interface, conn *net.TCPConn, ipAddr net.IP, nTun *water.Interface) {
@@ -51,7 +47,7 @@ func (c *client) sendServer(tunIface *water.Interface, conn *net.TCPConn, ipAddr
 		if !msg.IPHeader.Src.Equal(ipAddr) {
 			continue
 		}
-		if common.IsInternal(c.ipRange, msg.IPHeader.Dst.String()) {
+		if c.ipRange == nil || len(c.ipRange) == 0 || common.IsInternal(c.ipRange, msg.IPHeader.Dst.String()) {
 			_, err := nTun.Write(msg.Data)
 			if err != nil {
 				common.Logger.Warn("包发送失败", zap.Error(err))
@@ -69,7 +65,14 @@ func (c *client) reveiveTun(tunIface *water.Interface, nTun *water.Interface, ip
 	for msg := range packs {
 		common.Logger.Debug("NTUN", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()), zap.Any("Data", msg.Data))
 		if msg.IPHeader.Dst.Equal(ipAddr) {
-			tunIface.Write(msg.Data)
+			select {
+			case <-c.Ctx.Done():
+				return
+			case c.msgQueue <- msg.Data:
+				common.Logger.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
+			case <-time.After(time.Second * 30):
+				common.Logger.Warn("包转发超时，已丢弃")
+			}
 		}
 	}
 }
@@ -92,7 +95,7 @@ func (c *client) startPing(conn *net.TCPConn) {
 			c.Cancel()
 		case <-ticker.C:
 			conn.Write(protocol.BuildHBPing().Encode())
-			c.heartbeat.Reset(time.Second * 20)
+			c.heartbeat.Reset(time.Second * 30)
 			common.Logger.Debug("💓PING💓")
 		}
 	}
@@ -144,8 +147,14 @@ func (c *client) reveiveServer(tunIface *water.Interface, conn *net.TCPConn, ipA
 			c.resetPong()
 			if msg.TypeCheck(protocol.Heartbeat) {
 			} else if msg.IPHeader.Dst.Equal(ipAddr) {
-				tunIface.Write(msg.Data)
-				common.Logger.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
+				select {
+				case <-c.Ctx.Done():
+					return
+				case c.msgQueue <- msg.Data:
+					common.Logger.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
+				case <-time.After(time.Second * 30):
+					common.Logger.Warn("包转发超时，已丢弃")
+				}
 			}
 		}
 	}
@@ -175,18 +184,27 @@ func (c *client) updateIpRange() {
 	}
 }
 
-func (c *client) initIPRange() error {
+func (c *client) initIPRange() (err error) {
+	maxTime := 3
+	nextTime := 3
 	common.Logger.Info("IP池生成中...")
 	// url := "http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
 	url := "http://203.119.102.40/apnic/stats/apnic/delegated-apnic-latest"
-	ipRange, err := common.InternalIPInit(url, c.defaltRange)
-	if err != nil {
-		common.Logger.Error("国内IP池生成失败", zap.Error(err))
-		return err
+	for i := 0; i <= maxTime; i++ {
+		c.ipRange, err = common.InternalIPInit(url, c.defaltRange)
+		if err != nil {
+			common.Logger.Warn("国内IP池生成失败,等待重试", zap.Error(err))
+		}
+		if err == nil || i == maxTime {
+			break
+		}
+		time.Sleep(time.Second * time.Duration(nextTime))
+		nextTime *= 2
 	}
-	c.ipRange = ipRange
-	common.Logger.Info("IP池生成完成")
-	return nil
+	if err == nil {
+		common.Logger.Info("IP池生成完成")
+	}
+	return
 }
 
 func (c *client) Run() {
@@ -250,8 +268,6 @@ func (c *client) Run() {
 		common.Logger.Error("路由创建失败", zap.Error(err))
 	}
 
-	netns.Set(ktNs)
-
 	ktTunI, err := common.InitTUN(TunName)
 	if err != nil {
 		common.Logger.Error("网络空间TUN设备创建失败", zap.Error(err))
@@ -277,7 +293,7 @@ func (c *client) Run() {
 	}()
 
 	// 连接服务器
-	conn := c.connect()
+	conn := c.connect(devName)
 	// 关闭连接
 	defer func() {
 		conn.Close()
@@ -323,6 +339,25 @@ func (c *client) Run() {
 		}
 	}
 
+	// 主命名空间添加tun设备
+	tun0, err := mainNh.LinkByName(TunName)
+	if err != nil {
+		common.Logger.Error("设备查询失败", zap.Error(err))
+		return
+	}
+
+	defer mainNh.LinkDel(tun0)
+
+	mainNh.AddrAdd(tun0, &netlink.Addr{
+		IPNet: ipNet,
+	})
+	mainNh.LinkSetUp(tun0)
+	// 主命名空间添加默认路由
+	mainNh.RouteAdd(&netlink.Route{
+		Gw:  ipAddr,
+		Dst: nil,
+	})
+
 	ipAddr, ipNet, _ = net.ParseCIDR(devAddr.IPNet.String())
 	ipNet.IP = ipAddr
 	privS, privE, _ := common.PrivateIPv4Range(ipNet)
@@ -337,28 +372,6 @@ func (c *client) Run() {
 
 	// 启动定时刷新机制
 	go c.updateIpRange()
-
-	// 主命名空间添加tun设备
-	tun0, err := mainNh.LinkByName(TunName)
-	if err != nil {
-		common.Logger.Error("设备查询失败", zap.Error(err))
-		return
-	}
-
-	defer mainNh.LinkDel(tun0)
-
-	ipAddr, ipNet, _ = net.ParseCIDR(c.IpCIDR)
-	ipNet.IP = ipAddr
-
-	mainNh.AddrAdd(tun0, &netlink.Addr{
-		IPNet: ipNet,
-	})
-	mainNh.LinkSetUp(tun0)
-	// 主命名空间添加默认路由
-	mainNh.RouteAdd(&netlink.Route{
-		Gw:  ipAddr,
-		Dst: nil,
-	})
 
 	// 监听tun
 	go c.sendServer(mainTunI, conn, ipAddr, ktTunI)
@@ -379,5 +392,3 @@ func New(ctx context.Context, cancel context.CancelFunc, addr string) *client {
 		defaltRange: make([][]uint32, 0),
 	}
 }
-
-// ip route add 172.17.0.0/16 dev ktun0

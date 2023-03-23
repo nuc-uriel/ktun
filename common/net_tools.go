@@ -5,11 +5,15 @@ import (
 	"errors"
 	"ktun/protocol"
 	"net"
+	"syscall"
 
 	"github.com/songgao/water"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 	"go.uber.org/zap"
 )
+
+var DefaultDialer *net.Dialer
 
 func InitTUN(name string) (*water.Interface, error) {
 	// 创建tun
@@ -201,4 +205,21 @@ func GetDefaultAddr(nh *netlink.Handle, link netlink.Link) (addr netlink.Addr) {
 		addr = addrs[0]
 	}
 	return
+}
+
+func GetDial(ns, dev string) *net.Dialer {
+	nh, _ := netns.GetFromName(ns)
+	netns.Set(nh)
+	DefaultDialer = &net.Dialer{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// Set the network namespace of the socket
+				err := syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, dev)
+				if err != nil {
+					Logger.Warn("命名空间切换失败", zap.String("dev", dev), zap.Error(err))
+				}
+			})
+		},
+	}
+	return DefaultDialer
 }
