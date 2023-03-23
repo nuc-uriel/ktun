@@ -209,10 +209,10 @@ func GetDefaultAddr(nh *netlink.Handle, link netlink.Link) (addr netlink.Addr) {
 
 func GetDial(ns, dev string) *net.Dialer {
 	nh, _ := netns.GetFromName(ns)
-	netns.Set(nh)
 	DefaultDialer = &net.Dialer{
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
+				netns.Set(nh)
 				// Set the network namespace of the socket
 				err := syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, dev)
 				if err != nil {

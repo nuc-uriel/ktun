@@ -45,6 +45,7 @@ func (c *client) sendServer(tunIface *water.Interface, conn *net.TCPConn, ipAddr
 	for msg := range packs {
 		common.Logger.Debug("TUN", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()), zap.Any("Data", msg.Data))
 		if !msg.IPHeader.Src.Equal(ipAddr) {
+			common.Logger.Debug("调试", zap.String("ipAddr", ipAddr.String()))
 			continue
 		}
 		if c.ipRange == nil || len(c.ipRange) == 0 || common.IsInternal(c.ipRange, msg.IPHeader.Dst.String()) {
@@ -202,7 +203,7 @@ func (c *client) initIPRange() (err error) {
 		nextTime *= 2
 	}
 	if err == nil {
-		common.Logger.Info("IP池生成完成")
+		common.Logger.Info("IP池生成完成", zap.Int("长度", len(c.ipRange)))
 	}
 	return
 }
@@ -301,6 +302,21 @@ func (c *client) Run() {
 
 	common.Logger.Info("🎉服务器连接成功🎉", zap.String("addr", c.Addr))
 
+	devIpAddr, devIpNet, _ := net.ParseCIDR(devAddr.IPNet.String())
+	devIpNet.IP = devIpAddr
+	privS, privE, _ := common.PrivateIPv4Range(devIpNet)
+	c.defaltRange = [][]uint32{{privS, privE}}
+
+	// 初始化国内IP解析
+	err = c.initIPRange()
+	if err != nil {
+		common.Logger.Error("国内IP池初始化失败", zap.Error(err))
+		return
+	}
+
+	// 启动定时刷新机制
+	go c.updateIpRange()
+
 	// dhcp协商IP
 	if err := c.dhcp(conn); err != nil {
 		common.Logger.Fatal("DHCP获取失败", zap.Error(err))
@@ -308,6 +324,7 @@ func (c *client) Run() {
 
 	ipAddr, ipNet, _ := net.ParseCIDR(c.IpCIDR)
 	ipNet.IP = ipAddr
+	// 命名空间内需设置与主不同的ip地址
 	tun0IP := common.IPv42Unit32(ipAddr)
 	start, end, _ := common.PrivateIPv4Range(ipNet)
 	for i := start + 1; i < end; i++ {
@@ -348,6 +365,10 @@ func (c *client) Run() {
 
 	defer mainNh.LinkDel(tun0)
 
+	// 重新设置主命名空间地址
+	ipAddr, ipNet, _ = net.ParseCIDR(c.IpCIDR)
+	ipNet.IP = ipAddr
+
 	mainNh.AddrAdd(tun0, &netlink.Addr{
 		IPNet: ipNet,
 	})
@@ -357,21 +378,6 @@ func (c *client) Run() {
 		Gw:  ipAddr,
 		Dst: nil,
 	})
-
-	ipAddr, ipNet, _ = net.ParseCIDR(devAddr.IPNet.String())
-	ipNet.IP = ipAddr
-	privS, privE, _ := common.PrivateIPv4Range(ipNet)
-	c.defaltRange = [][]uint32{{privS, privE}}
-
-	// 初始化国内IP解析
-	err = c.initIPRange()
-	if err != nil {
-		common.Logger.Error("国内IP池初始化失败", zap.Error(err))
-		return
-	}
-
-	// 启动定时刷新机制
-	go c.updateIpRange()
 
 	// 监听tun
 	go c.sendServer(mainTunI, conn, ipAddr, ktTunI)
