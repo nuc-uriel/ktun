@@ -3,7 +3,9 @@ package client
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"strings"
 	"time"
 
 	"ktun/common"
@@ -22,17 +24,21 @@ var (
 )
 
 type client struct {
-	Addr        string
-	IpCIDR      string
-	Ctx         context.Context
-	Cancel      context.CancelFunc
-	msgQueue    chan []byte
-	heartbeat   *time.Timer
-	ipRange     [][]uint32
-	defaltRange [][]uint32
+	Addr          string
+	IpCIDR        string
+	Ctx           context.Context
+	Cancel        context.CancelFunc
+	sendTunQueue  chan []byte
+	sendConQueue  chan []byte
+	sendKTunQueue chan []byte
+	heartbeat     *time.Timer
+	ipRange       [][]uint32
+	defaltRange   [][]uint32
 }
 
 func (c *client) connect(dev string) *net.TCPConn {
+	nh, _ := netns.GetFromName(NsName)
+	netns.Set(nh)
 	conn, err := common.GetDial(NsName, dev).Dial("tcp", c.Addr)
 	if err != nil {
 		common.Logger.Fatal("连接服务器失败", zap.String("addr", c.Addr), zap.Error(err))
@@ -40,40 +46,52 @@ func (c *client) connect(dev string) *net.TCPConn {
 	return conn.(*net.TCPConn)
 }
 
-func (c *client) sendServer(tunIface *water.Interface, conn *net.TCPConn, ipAddr net.IP, nTun *water.Interface) {
+func (c *client) sendServer(tunIface *water.Interface, ipAddr net.IP, nTun *water.Interface) {
 	packs := common.ReadPack(c.Ctx, tunIface)
 	for msg := range packs {
 		common.Logger.Debug("TUN", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()), zap.Any("Data", msg.Data))
 		if !msg.IPHeader.Src.Equal(ipAddr) {
-			common.Logger.Debug("调试", zap.String("ipAddr", ipAddr.String()))
 			continue
 		}
 		if c.ipRange == nil || len(c.ipRange) == 0 || common.IsInternal(c.ipRange, msg.IPHeader.Dst.String()) {
-			_, err := nTun.Write(msg.Data)
-			if err != nil {
-				common.Logger.Warn("包发送失败", zap.Error(err))
-			}
+			c.sendMsg(msg.Data, c.sendKTunQueue)
 			common.Logger.Debug("本机转发请求", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
 		} else {
-			conn.Write(msg.Encode())
+			c.sendMsg(msg.Encode(), c.sendConQueue)
 			common.Logger.Debug("👄本机发出请求👄", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
 		}
 	}
 }
 
-func (c *client) reveiveTun(tunIface *water.Interface, nTun *water.Interface, ipAddr net.IP) {
+func (c *client) sendMsg(data []byte, queue chan []byte) {
+	select {
+	case <-c.Ctx.Done():
+	case queue <- data:
+	case <-time.After(time.Second * 30):
+		common.Logger.Warn("包转发超时，已丢弃")
+	}
+}
+
+func (c *client) sender(writer io.Writer, queue chan []byte) {
+	for {
+		select {
+		case <-c.Ctx.Done():
+			return
+		case pack, isOpen := <-queue:
+			if !isOpen {
+				return
+			}
+			writer.Write(pack)
+		}
+	}
+}
+
+func (c *client) reveiveTun(nTun *water.Interface, ipAddr net.IP) {
 	packs := common.ReadPack(c.Ctx, nTun)
 	for msg := range packs {
 		common.Logger.Debug("NTUN", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()), zap.Any("Data", msg.Data))
 		if msg.IPHeader.Dst.Equal(ipAddr) {
-			select {
-			case <-c.Ctx.Done():
-				return
-			case c.msgQueue <- msg.Data:
-				common.Logger.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
-			case <-time.After(time.Second * 30):
-				common.Logger.Warn("包转发超时，已丢弃")
-			}
+			c.sendMsg(msg.Data, c.sendTunQueue)
 		}
 	}
 }
@@ -84,7 +102,7 @@ func (c *client) resetPong() {
 
 func (c *client) startPing(conn *net.TCPConn) {
 	c.heartbeat = time.NewTimer(time.Minute)
-	ticker := time.NewTicker(time.Second * 30)
+	ticker := time.NewTicker(time.Second * 20)
 	for {
 		select {
 		case <-c.Ctx.Done():
@@ -95,8 +113,7 @@ func (c *client) startPing(conn *net.TCPConn) {
 			common.Logger.Info("服务器超时, 断开连接。。。")
 			c.Cancel()
 		case <-ticker.C:
-			conn.Write(protocol.BuildHBPing().Encode())
-			c.heartbeat.Reset(time.Second * 30)
+			c.sendMsg(protocol.BuildHBPing().Encode(), c.sendConQueue)
 			common.Logger.Debug("💓PING💓")
 		}
 	}
@@ -117,7 +134,6 @@ func (c *client) dhcp(conn *net.TCPConn) error {
 			timeout.Stop()
 			return errors.New("退出")
 		case <-timeout.C:
-			common.Logger.Info("服务器超时, 断开连接。。。")
 			return errors.New("服务器超时, 断开连接")
 		default:
 			msg, err := protocol.Decode(conn)
@@ -133,7 +149,41 @@ func (c *client) dhcp(conn *net.TCPConn) error {
 	}
 }
 
-func (c *client) reveiveServer(tunIface *water.Interface, conn *net.TCPConn, ipAddr net.IP) {
+func (c *client) connSub(dev string) (*net.TCPConn, error) {
+	code := []byte(strings.Split(c.IpCIDR, "/")[0])
+	conn := c.connect(dev)
+	reqMsg := protocol.NewKTunMessage().WithReq().WithSub().FullBody(code)
+	_, err := conn.Write(reqMsg.Encode())
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	timeout := time.NewTimer(time.Minute)
+
+	for {
+		select {
+		case <-c.Ctx.Done():
+			timeout.Stop()
+			conn.Close()
+			return nil, errors.New("退出")
+		case <-timeout.C:
+			conn.Close()
+			return nil, errors.New("服务器超时, 断开连接")
+		default:
+			msg, err := protocol.Decode(conn)
+			if err != nil {
+				conn.Close()
+				common.Logger.Info("😭服务器断开连接😭。。。", zap.Error(err))
+				return nil, err
+			}
+			if msg.TypeCheck(protocol.Sub) && common.Bytes2Str(msg.Data) == common.Bytes2Str(code) {
+				return conn, nil
+			}
+		}
+	}
+}
+
+func (c *client) reveiveServer(conn *net.TCPConn, ipAddr net.IP) {
 	for {
 		select {
 		case <-c.Ctx.Done():
@@ -148,26 +198,8 @@ func (c *client) reveiveServer(tunIface *water.Interface, conn *net.TCPConn, ipA
 			c.resetPong()
 			if msg.TypeCheck(protocol.Heartbeat) {
 			} else if msg.IPHeader.Dst.Equal(ipAddr) {
-				select {
-				case <-c.Ctx.Done():
-					return
-				case c.msgQueue <- msg.Data:
-					common.Logger.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
-				case <-time.After(time.Second * 30):
-					common.Logger.Warn("包转发超时，已丢弃")
-				}
+				c.sendMsg(msg.Data, c.sendTunQueue)
 			}
-		}
-	}
-}
-
-func (c *client) sender(tunIface *water.Interface) {
-	for {
-		select {
-		case <-c.Ctx.Done():
-			return
-		case pack := <-c.msgQueue:
-			tunIface.Write(pack)
 		}
 	}
 }
@@ -208,7 +240,7 @@ func (c *client) initIPRange() (err error) {
 	return
 }
 
-func (c *client) Run() {
+func (c *client) Run(subCount int) {
 	// 创建tun0
 	mainTunI, err := common.InitTUN(TunName)
 	if err != nil {
@@ -322,6 +354,17 @@ func (c *client) Run() {
 		common.Logger.Fatal("DHCP获取失败", zap.Error(err))
 	}
 
+	// 扩展子链接
+	subs := make([]*net.TCPConn, 0)
+	for i := 0; i < subCount; i++ {
+		sub, err := c.connSub(devName)
+		if err != nil {
+			common.Logger.Warn("扩展通道失败", zap.Error(err))
+		} else {
+			subs = append(subs, sub)
+		}
+	}
+
 	ipAddr, ipNet, _ := net.ParseCIDR(c.IpCIDR)
 	ipNet.IP = ipAddr
 	// 命名空间内需设置与主不同的ip地址
@@ -381,21 +424,32 @@ func (c *client) Run() {
 	})
 
 	// 监听tun
-	go c.sendServer(mainTunI, conn, ipAddr, ktTunI)
+	go c.sendServer(mainTunI, ipAddr, ktTunI)
 	go c.startPing(conn)
-	go c.reveiveServer(mainTunI, conn, ipAddr)
-	go c.reveiveTun(mainTunI, ktTunI, ipAddr)
-	go c.sender(mainTunI)
+	go c.reveiveTun(ktTunI, ipAddr)
+
+	go c.reveiveServer(conn, ipAddr)
+	go c.sender(conn, c.sendConQueue)
+
+	go c.sender(mainTunI, c.sendTunQueue)
+	go c.sender(ktTunI, c.sendKTunQueue)
+
+	for _, subConn := range subs {
+		go c.reveiveServer(subConn, ipAddr)
+		go c.sender(subConn, c.sendConQueue)
+	}
 
 	<-c.Ctx.Done()
 }
 
 func New(ctx context.Context, cancel context.CancelFunc, addr string) *client {
 	return &client{
-		Addr:        addr,
-		Ctx:         ctx,
-		Cancel:      cancel,
-		msgQueue:    make(chan []byte, 200),
-		defaltRange: make([][]uint32, 0),
+		Addr:          addr,
+		Ctx:           ctx,
+		Cancel:        cancel,
+		sendTunQueue:  make(chan []byte, 200),
+		sendConQueue:  make(chan []byte, 200),
+		sendKTunQueue: make(chan []byte, 200),
+		defaltRange:   make([][]uint32, 0),
 	}
 }

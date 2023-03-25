@@ -23,7 +23,6 @@ var serverUpCmd = &cobra.Command{
 		tcpAddr := viper.GetString("server.tcp")
 		name := viper.GetString("server.name")
 		ipCidr := viper.GetString("server.ipcidr")
-		outDev := viper.GetString("server.outdev")
 		if daemon {
 			if _, err := net.Dial("tcp", tcpAddr); err == nil {
 				common.Logger.Fatal("服务启动失败, TCP服务端口被占用")
@@ -44,7 +43,7 @@ var serverUpCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go common.WatchExit(ctx, cancel)
-		server.New(ctx, cancel, tcpAddr, name, ipCidr, outDev).Run()
+		server.New(ctx, cancel, tcpAddr, name, ipCidr).Run()
 	},
 }
 
@@ -53,11 +52,9 @@ func init() {
 	serverUpCmd.Flags().StringP("tcp", "t", "0.0.0.0:7890", "TCP服务地址, 如: 0.0.0.0:7890")
 	serverUpCmd.Flags().StringP("name", "n", "tun0", "TUN设备名称, 如: tun0")
 	serverUpCmd.Flags().StringP("ipcidr", "i", "10.0.10.1/24", "TUN设备IP地址, 如: 10.0.10.1/24")
-	serverUpCmd.Flags().StringP("outdev", "o", "eth0", "出口设备端口")
 	serverUpCmd.Flags().BoolP("daemon", "d", false, "后台启动服务")
 	viper.BindPFlag("server.tcp", serverUpCmd.Flags().Lookup("tcp"))
 	viper.BindPFlag("server.name", serverUpCmd.Flags().Lookup("name"))
 	viper.BindPFlag("server.ipcidr", serverUpCmd.Flags().Lookup("ipcidr"))
 	viper.BindPFlag("server.daemon", serverUpCmd.Flags().Lookup("daemon"))
-	viper.BindPFlag("server.outdev", serverUpCmd.Flags().Lookup("outdev"))
 }

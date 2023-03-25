@@ -19,6 +19,7 @@ var clientUpCmd = &cobra.Command{
 	Short: "启动客户端",
 	Run: func(cmd *cobra.Command, args []string) {
 		tcpAddr := viper.GetString("client.tcp")
+		count := viper.GetInt("client.count")
 		daemon := viper.GetBool("client.daemon")
 		if daemon {
 			command := exec.Command(os.Args[0], "client", "up", "-t", tcpAddr, "--daemon=false")
@@ -37,14 +38,16 @@ var clientUpCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go common.WatchExit(ctx, cancel)
-		client.New(ctx, cancel, tcpAddr).Run()
+		client.New(ctx, cancel, tcpAddr).Run(count)
 	},
 }
 
 func init() {
 	clientCmd.AddCommand(clientUpCmd)
 	clientUpCmd.Flags().StringP("tcp", "t", "11.11.11.11:7890", "TCP服务地址, 如: 11.11.11.11:7890")
+	clientUpCmd.Flags().IntP("count", "u", 10, "服务器连接协程数, 如: 10")
 	clientUpCmd.Flags().BoolP("daemon", "d", false, "后台启动服务")
 	viper.BindPFlag("client.tcp", clientUpCmd.Flags().Lookup("tcp"))
+	viper.BindPFlag("client.count", clientUpCmd.Flags().Lookup("count"))
 	viper.BindPFlag("client.daemon", clientUpCmd.Flags().Lookup("daemon"))
 }

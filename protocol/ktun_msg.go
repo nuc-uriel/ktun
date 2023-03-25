@@ -21,7 +21,7 @@ const (
 	DHCP                          // dhcp分配IP
 	Heartbeat                     // 心跳
 	NetPack                       // 网络包
-	Other1                        // 占位
+	Sub                           // 附属连接
 	Other2                        // 占位
 	OK                            // 确认 | 0-> ERR
 	Rrequest                      // 请求 / 0-> 响应
@@ -116,6 +116,11 @@ func (msg *KTunMessage) WithHeartbeat() *KTunMessage {
 
 func (msg *KTunMessage) WithNetPack() *KTunMessage {
 	msg.MsgType |= NetPack
+	return msg
+}
+
+func (msg *KTunMessage) WithSub() *KTunMessage {
+	msg.MsgType |= Sub
 	return msg
 }
 

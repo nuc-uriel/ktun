@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"ktun/common"
 	"ktun/protocol"
 	"net"
@@ -19,10 +20,9 @@ type server struct {
 	Addr        string
 	TunName     string
 	IpCIDR      string
-	OutDev      string
 	Ctx         context.Context
 	Cancel      context.CancelFunc
-	clientConns map[string]*net.Conn
+	clientConns map[string]chan []byte
 	ipPool      []string
 	msgQueue    chan []byte
 	lock        *sync.Mutex
@@ -82,8 +82,16 @@ func (s *server) handleClient(conn net.Conn, log *zap.Logger) {
 	if err != nil {
 		log.Error("IP分配失败", zap.Error(err))
 	}
-	defer s.relaseIP(ip)
-	acquire := false
+	isSub := false
+	defer func() {
+		if !isSub {
+			s.relaseIP(ip)
+		}
+		if queue, exist := s.clientConns[ip]; exist {
+			close(queue)
+		}
+	}()
+	alloced := false
 	for {
 		select {
 		case <-s.Ctx.Done():
@@ -104,19 +112,28 @@ func (s *server) handleClient(conn net.Conn, log *zap.Logger) {
 				conn.Write(dhcpMsg.Encode())
 				log = log.With(zap.String("TUN IP", ip))
 				log.Debug("IP分配成功")
-				s.clientConns[ip] = &conn
-				acquire = true
-			} else if msg.TypeCheck(protocol.NetPack|protocol.Rrequest) && !acquire {
+				s.clientConns[ip] = make(chan []byte, 200)
+				go s.sender(conn, s.clientConns[ip])
+				alloced = true
+			} else if msg.TypeCheck(protocol.Sub | protocol.Rrequest) {
+				subIp := string(msg.Data)
+				log = log.With(zap.String("TUN IP", subIp))
+				if queue, exist := s.clientConns[subIp]; exist {
+					subMsg := protocol.NewKTunMessage().WithResp().WithSub().FullBody([]byte(subIp))
+					conn.Write(subMsg.Encode())
+					go s.sender(conn, queue)
+					log.Debug("附属通道建立成功")
+					s.relaseIP(ip)
+					ip = subIp
+					alloced = true
+					isSub = true
+				} else {
+					return
+				}
+			} else if msg.TypeCheck(protocol.NetPack|protocol.Rrequest) && !alloced {
 				log.Warn("IP未分配, 包丢弃")
 			} else {
-				select {
-				case <-s.Ctx.Done():
-					return
-				case s.msgQueue <- msg.Data:
-					log.Debug("👂🏻本机收到数据👂🏻", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
-				case <-time.After(time.Second * 30):
-					log.Warn("包转发超时，已丢弃")
-				}
+				s.sendMsg(msg.Data, s.msgQueue)
 			}
 		}
 	}
@@ -125,20 +142,9 @@ func (s *server) handleClient(conn net.Conn, log *zap.Logger) {
 func (s *server) reciver(tunIface *water.Interface) {
 	packs := common.ReadPack(s.Ctx, tunIface)
 	for msg := range packs {
-		if conn, ok := s.clientConns[msg.IPHeader.Dst.String()]; ok {
-			(*conn).Write(msg.Encode())
+		if queue, ok := s.clientConns[msg.IPHeader.Dst.String()]; ok {
+			s.sendMsg(msg.Encode(), queue)
 			common.Logger.Debug("👄本机发出数据👄", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
-		}
-	}
-}
-
-func (s *server) sender(tunIface *water.Interface) {
-	for {
-		select {
-		case <-s.Ctx.Done():
-			return
-		case pack := <-s.msgQueue:
-			tunIface.Write(pack)
 		}
 	}
 }
@@ -164,6 +170,29 @@ func (s *server) initIpPool() {
 	s.IpCIDR = fmt.Sprintf("%s/%d", sIP, s.mask)
 }
 
+func (s *server) sendMsg(data []byte, queue chan []byte) {
+	select {
+	case <-s.Ctx.Done():
+	case queue <- data:
+	case <-time.After(time.Second * 30):
+		common.Logger.Warn("包转发超时，已丢弃")
+	}
+}
+
+func (s *server) sender(writer io.Writer, queue chan []byte) {
+	for {
+		select {
+		case <-s.Ctx.Done():
+			return
+		case pack, isOpen := <-queue:
+			if !isOpen {
+				return
+			}
+			writer.Write(pack)
+		}
+	}
+}
+
 func (s *server) Run() {
 	// 解析IP池
 	s.initIpPool()
@@ -182,10 +211,10 @@ func (s *server) Run() {
 	if err != nil {
 		common.Logger.Warn("IPTable配置失败", zap.Error(err))
 	}
-	if exist, err := ipt.Exists("nat", "POSTROUTING", "-s", s.IpCIDR, "-o", s.OutDev, "-j", "MASQUERADE"); err != nil {
+	if exist, err := ipt.Exists("nat", "POSTROUTING", "-s", s.IpCIDR, "-j", "MASQUERADE"); err != nil {
 		common.Logger.Warn("IPTable配置查询失败", zap.Error(err))
 	} else if !exist {
-		err = ipt.Append("nat", "POSTROUTING", "-s", s.IpCIDR, "-o", s.OutDev, "-j", "MASQUERADE")
+		err = ipt.Append("nat", "POSTROUTING", "-s", s.IpCIDR, "-j", "MASQUERADE")
 		if err != nil {
 			common.Logger.Error("IPTable配置添加失败", zap.Error(err))
 			return
@@ -194,7 +223,7 @@ func (s *server) Run() {
 
 	// 删除masquerade
 	defer func() {
-		err = ipt.Delete("nat", "POSTROUTING", "-s", s.IpCIDR, "-o", s.OutDev, "-j", "MASQUERADE")
+		err = ipt.Delete("nat", "POSTROUTING", "-s", s.IpCIDR, "-o", "-j", "MASQUERADE")
 		if err != nil {
 			common.Logger.Warn("IPTable删除失败", zap.Error(err))
 		}
@@ -217,20 +246,19 @@ func (s *server) Run() {
 
 	// 监听tun
 	go s.reciver(tunIface)
-	go s.sender(tunIface)
+	go s.sender(tunIface, s.msgQueue)
 
 	<-s.Ctx.Done()
 }
 
-func New(ctx context.Context, cancel context.CancelFunc, addr, tunName, ipCIDR, outDev string) *server {
+func New(ctx context.Context, cancel context.CancelFunc, addr, tunName, ipCIDR string) *server {
 	return &server{
 		Addr:        addr,
 		TunName:     tunName,
 		IpCIDR:      ipCIDR,
-		OutDev:      outDev,
 		Ctx:         ctx,
 		Cancel:      cancel,
-		clientConns: make(map[string]*net.Conn),
+		clientConns: make(map[string]chan []byte),
 		ipPool:      make([]string, 0),
 		msgQueue:    make(chan []byte, 200),
 		lock:        new(sync.Mutex),
