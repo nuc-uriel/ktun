@@ -46,11 +46,12 @@ func (c *client) connect(dev string) *net.TCPConn {
 	return conn.(*net.TCPConn)
 }
 
-func (c *client) sendServer(tunIface *water.Interface, ipAddr net.IP, nTun *water.Interface) {
+func (c *client) reveiveMainTun(tunIface *water.Interface, ipAddr net.IP) {
 	packs := common.ReadPack(c.Ctx, tunIface)
 	for msg := range packs {
 		common.Logger.Debug("TUN", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()), zap.Any("Data", msg.Data))
 		if !msg.IPHeader.Src.Equal(ipAddr) {
+			common.Logger.Info("本机丢弃请求", zap.String("Src", msg.IPHeader.Src.String()), zap.String("Dst", msg.IPHeader.Dst.String()))
 			continue
 		}
 		if c.ipRange == nil || len(c.ipRange) == 0 || common.IsInternal(c.ipRange, msg.IPHeader.Dst.String()) {
@@ -424,15 +425,31 @@ func (c *client) Run(subCount int) {
 	})
 
 	// 监听tun
-	go c.sendServer(mainTunI, ipAddr, ktTunI)
 	go c.startPing(conn)
-	go c.reveiveTun(ktTunI, ipAddr)
 
-	go c.reveiveServer(conn, ipAddr)
-	go c.sender(conn, c.sendConQueue)
+	go c.reveiveMainTun(mainTunI, ipAddr)
+
+	go func() {
+		_, err := io.Copy(mainTunI, ktTunI)
+		if err != nil && err != io.EOF {
+			common.Logger.Warn("数据复制失败", zap.Error(err))
+		}
+	}()
+
+	// go c.reveiveTun(ktTunI, ipAddr)
+
+	// go func() {
+	// 	_, err := io.Copy(ktTunI, mainTunI)
+	// 	if err != nil {
+	// 		common.Logger.Warn("数据复制失败", zap.Error(err))
+	// 	}
+	// }()
 
 	go c.sender(mainTunI, c.sendTunQueue)
 	go c.sender(ktTunI, c.sendKTunQueue)
+
+	go c.reveiveServer(conn, ipAddr)
+	go c.sender(conn, c.sendConQueue)
 
 	for _, subConn := range subs {
 		go c.reveiveServer(subConn, ipAddr)
